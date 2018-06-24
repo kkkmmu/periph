@@ -10,10 +10,9 @@ import (
 	"image"
 	"image/color"
 
-	"periph.io/x/periph/conn"
+	"periph.io/x/periph/conn/display"
 	"periph.io/x/periph/conn/physic"
 	"periph.io/x/periph/conn/spi"
-	"periph.io/x/periph/devices"
 )
 
 // ToRGB converts a slice of color.NRGBA to a byte stream of RGB pixels.
@@ -78,6 +77,7 @@ func New(p spi.Port, o *Opts) (*Dev, error) {
 		numPixels:   o.NumPixels,
 		rawBuf:      buf,
 		pixels:      buf[4 : 4+4*o.NumPixels],
+		rect:        image.Rectangle{Max: image.Point{X: o.NumPixels, Y: 1}},
 	}, nil
 }
 
@@ -96,45 +96,48 @@ type Dev struct {
 	// It can be changed, it will take effect on the next Draw() or Write() call.
 	Temperature uint16
 
-	s         spi.Conn //
-	l         lut      // Updated at each .Write() call.
-	numPixels int      //
-	rawBuf    []byte   // Raw buffer sent over SPI. Cached to reduce heap fragmentation.
-	pixels    []byte   // Double buffer of pixels, to enable partial painting via Draw(). Effectively points inside rawBuf.
+	s         spi.Conn        //
+	l         lut             // Updated at each .Write() call.
+	numPixels int             //
+	rawBuf    []byte          // Raw buffer sent over SPI. Cached to reduce heap fragmentation.
+	pixels    []byte          // Double buffer of pixels, to enable partial painting via Draw(). Effectively points inside rawBuf.
+	rect      image.Rectangle //
 }
 
 func (d *Dev) String() string {
 	return fmt.Sprintf("APA102{I:%d, T:%dK, %dLEDs, %s}", d.Intensity, d.Temperature, d.numPixels, d.s)
 }
 
-// ColorModel implements devices.Display. There's no surprise, it is
+// ColorModel implements display.Drawer. There's no surprise, it is
 // color.NRGBAModel.
 func (d *Dev) ColorModel() color.Model {
 	return color.NRGBAModel
 }
 
-// Bounds implements devices.Display. Min is guaranteed to be {0, 0}.
+// Bounds implements display.Drawer. Min is guaranteed to be {0, 0}.
 func (d *Dev) Bounds() image.Rectangle {
-	return image.Rectangle{Max: image.Point{X: d.numPixels, Y: 1}}
+	return d.rect
 }
 
-// Draw implements devices.Display.
+// Draw implements display.Drawer.
 //
 // Using something else than image.NRGBA is 10x slower. When using image.NRGBA,
 // the alpha channel is ignored.
-func (d *Dev) Draw(r image.Rectangle, src image.Image, sp image.Point) {
-	r = r.Intersect(d.Bounds())
-	srcR := src.Bounds()
+func (d *Dev) Draw(img image.Image, sp image.Point) error {
+	srcR := img.Bounds()
 	srcR.Min = srcR.Min.Add(sp)
-	if dX := r.Dx(); dX < srcR.Dx() {
+	if dX := d.rect.Dx(); dX < srcR.Dx() {
 		srcR.Max.X = srcR.Min.X + dX
 	}
-	if dY := r.Dy(); dY < srcR.Dy() {
+	if dY := d.rect.Dy(); dY < srcR.Dy() {
 		srcR.Max.Y = srcR.Min.Y + dY
 	}
+	if srcR.Dx() == 0 || srcR.Dy() == 0 {
+		return nil
+	}
 	d.l.init(d.Intensity, d.Temperature)
-	d.l.rasterImg(d.pixels, r, src, srcR)
-	_ = d.s.Tx(d.rawBuf, nil)
+	d.l.rasterImg(d.pixels, d.rect, img, srcR)
+	return d.s.Tx(d.rawBuf, nil)
 }
 
 // Write accepts a stream of raw RGB pixels and sends it as APA102 encoded
@@ -299,10 +302,10 @@ func (l *lut) raster(dst []byte, src []byte) {
 }
 
 // rasterImg is the generic version of raster.
-func (l *lut) rasterImg(dst []byte, r image.Rectangle, src image.Image, srcR image.Rectangle) {
+func (l *lut) rasterImg(dst []byte, rect image.Rectangle, src image.Image, srcR image.Rectangle) {
 	// Render directly into the buffer for maximum performance and to keep
 	// untouched sections intact.
-	deltaX4 := 4 * (r.Min.X - srcR.Min.X)
+	deltaX4 := 4 * (rect.Min.X - srcR.Min.X)
 	if img, ok := src.(*image.NRGBA); ok {
 		// Fast path for image.NRGBA.
 		pix := img.Pix[srcR.Min.Y*img.Stride:]
@@ -352,6 +355,4 @@ func (l *lut) rasterImg(dst []byte, r image.Rectangle, src image.Image, srcR ima
 	}
 }
 
-var _ conn.Resource = &Dev{}
-var _ devices.Display = &Dev{}
-var _ fmt.Stringer = &Dev{}
+var _ display.Drawer = &Dev{}

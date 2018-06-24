@@ -10,10 +10,9 @@ import (
 	"image"
 	"image/color"
 
-	"periph.io/x/periph/conn"
+	"periph.io/x/periph/conn/display"
 	"periph.io/x/periph/conn/gpio/gpiostream"
 	"periph.io/x/periph/conn/physic"
-	"periph.io/x/periph/devices"
 )
 
 // NRZ converts a byte into the MSB-first Non-Return-to-Zero encoded 24 bits.
@@ -82,6 +81,7 @@ func New(p gpiostream.PinOut, opts *Opts) (*Dev, error) {
 			Bits: make([]byte, opts.NumPixels*3*opts.Channels),
 			LSBF: false,
 		},
+		rect: image.Rect(0, 0, opts.NumPixels, 1),
 	}, nil
 }
 
@@ -91,7 +91,8 @@ type Dev struct {
 	numPixels int
 	channels  int                  // Number of channels per pixel
 	b         gpiostream.BitStream // NRZ encoded bits; cached to reduce heap fragmentation
-	buf       []byte               // Double buffer of RGB/RGBW pixels; enables partial Draw()
+	buf       []byte               // Double buffer of RGB/RGBW pixels
+	rect      image.Rectangle      //
 }
 
 func (d *Dev) String() string {
@@ -117,19 +118,19 @@ func (d *Dev) Halt() error {
 	return nil
 }
 
-// ColorModel implements devices.Display.
+// ColorModel implements display.Drawer.
 //
 // It is color.NRGBAModel.
 func (d *Dev) ColorModel() color.Model {
 	return color.NRGBAModel
 }
 
-// Bounds implements devices.Display. Min is guaranteed to be {0, 0}.
+// Bounds implements display.Drawer. Min is guaranteed to be {0, 0}.
 func (d *Dev) Bounds() image.Rectangle {
-	return image.Rectangle{Max: image.Point{X: d.numPixels, Y: 1}}
+	return d.rect
 }
 
-// Draw implements devices.Display.
+// Draw implements display.Drawer.
 //
 // Using something else than image.NRGBA is 10x slower and is not recommended.
 // When using image.NRGBA, the alpha channel is ignored in RGB mode and used as
@@ -137,31 +138,32 @@ func (d *Dev) Bounds() image.Rectangle {
 //
 // A back buffer is kept so that partial updates are supported, albeit the full
 // LED strip is updated synchronously.
-func (d *Dev) Draw(r image.Rectangle, src image.Image, sp image.Point) {
-	r = r.Intersect(d.Bounds())
-	srcR := src.Bounds()
+func (d *Dev) Draw(img image.Image, sp image.Point) error {
+	srcR := img.Bounds()
 	srcR.Min = srcR.Min.Add(sp)
-	if dX := r.Dx(); dX < srcR.Dx() {
+	if dX := d.rect.Dx(); dX < srcR.Dx() {
 		srcR.Max.X = srcR.Min.X + dX
 	}
-	if dY := r.Dy(); dY < srcR.Dy() {
+	if dY := d.rect.Dy(); dY < srcR.Dy() {
 		srcR.Max.Y = srcR.Min.Y + dY
 	}
+
 	if d.buf == nil {
 		// Allocate d.buf on first Draw() call, in case the user only wants to use
 		// .Write().
 		d.buf = make([]byte, d.numPixels*d.channels)
 	}
-	if img, ok := src.(*image.NRGBA); ok {
+	if imgRGB, ok := img.(*image.NRGBA); ok {
 		// Fast path for image.NRGBA.
-		base := srcR.Min.Y * img.Stride
-		raster(d.b.Bits, img.Pix[base+4*srcR.Min.X:base+4*srcR.Max.X], d.channels, 4)
+		base := -imgRGB.Rect.Min.Y * imgRGB.Stride
+		raster(d.b.Bits, imgRGB.Pix[base+4*imgRGB.Rect.Min.X:base+4*imgRGB.Rect.Max.X], d.channels, 4)
+
 	} else {
 		// Generic version.
 		m := srcR.Max.X - srcR.Min.X
 		if d.channels == 3 {
 			for i := 0; i < m; i++ {
-				c := color.NRGBAModel.Convert(src.At(srcR.Min.X+i, srcR.Min.Y)).(color.NRGBA)
+				c := color.NRGBAModel.Convert(img.At(srcR.Min.X+i, srcR.Min.Y)).(color.NRGBA)
 				j := 3 * i
 				put(d.b.Bits[3*(j+0):], c.G)
 				put(d.b.Bits[3*(j+1):], c.R)
@@ -169,7 +171,7 @@ func (d *Dev) Draw(r image.Rectangle, src image.Image, sp image.Point) {
 			}
 		} else {
 			for i := 0; i < m; i++ {
-				c := color.NRGBAModel.Convert(src.At(srcR.Min.X+i, srcR.Min.Y)).(color.NRGBA)
+				c := color.NRGBAModel.Convert(img.At(srcR.Min.X+i, srcR.Min.Y)).(color.NRGBA)
 				j := 4 * i
 				put(d.b.Bits[3*(j+0):], c.G)
 				put(d.b.Bits[3*(j+1):], c.R)
@@ -178,7 +180,7 @@ func (d *Dev) Draw(r image.Rectangle, src image.Image, sp image.Point) {
 			}
 		}
 	}
-	_ = d.p.StreamOut(&d.b)
+	return d.p.StreamOut(&d.b)
 }
 
 // Write accepts a stream of raw RGB/RGBW pixels and sends it as NRZ encoded
@@ -235,6 +237,4 @@ func put(out []byte, v byte) {
 	out[2] = byte(w)
 }
 
-var _ conn.Resource = &Dev{}
-var _ devices.Display = &Dev{}
-var _ fmt.Stringer = &Dev{}
+var _ display.Drawer = &Dev{}

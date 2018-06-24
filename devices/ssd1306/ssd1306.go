@@ -43,11 +43,11 @@ import (
 	"image/draw"
 
 	"periph.io/x/periph/conn"
+	"periph.io/x/periph/conn/display"
 	"periph.io/x/periph/conn/gpio"
 	"periph.io/x/periph/conn/i2c"
 	"periph.io/x/periph/conn/physic"
 	"periph.io/x/periph/conn/spi"
-	"periph.io/x/periph/devices"
 	"periph.io/x/periph/devices/ssd1306/image1bit"
 )
 
@@ -158,7 +158,6 @@ type Dev struct {
 	startCol, endCol   int
 	scrolled           bool
 	halted             bool
-	err                error
 }
 
 func (d *Dev) String() string {
@@ -168,44 +167,37 @@ func (d *Dev) String() string {
 	return fmt.Sprintf("ssd1360.Dev{%s, %s}", d.c, d.rect.Max)
 }
 
-// ColorModel implements devices.Display.
+// ColorModel implements display.Drawer.
 //
 // It is a one bit color model, as implemented by image1bit.Bit.
 func (d *Dev) ColorModel() color.Model {
 	return image1bit.BitModel
 }
 
-// Bounds implements devices.Display. Min is guaranteed to be {0, 0}.
+// Bounds implements display.Drawer. Min is guaranteed to be {0, 0}.
 func (d *Dev) Bounds() image.Rectangle {
 	return d.rect
 }
 
-// Draw implements devices.Display.
+// Draw implements display.Drawer.
 //
 // It draws synchronously, once this function returns, the display is updated.
-// It means that on slow bus  (I²C), it may be preferable to defer Draw() calls
+// It means that on slow bus (I²C), it may be preferable to defer Draw() calls
 // to a background goroutine.
-//
-// It discards any failure.
-func (d *Dev) Draw(r image.Rectangle, src image.Image, sp image.Point) {
+func (d *Dev) Draw(img image.Image, sp image.Point) error {
 	var next []byte
-	if img, ok := src.(*image1bit.VerticalLSB); ok && r == d.Bounds() && src.Bounds() == d.rect && sp.X == 0 && sp.Y == 0 {
+	if imgV, ok := img.(*image1bit.VerticalLSB); ok && imgV.Rect == d.rect && sp.X == 0 && sp.Y == 0 {
 		// Exact size, full frame, image1bit encoding: fast path!
-		next = img.Pix
+		next = imgV.Pix
 	} else {
 		// Double buffering.
 		if d.next == nil {
 			d.next = image1bit.NewVerticalLSB(d.rect)
 		}
 		next = d.next.Pix
-		draw.Src.Draw(d.next, r, src, sp)
+		draw.Src.Draw(d.next, d.rect, img, sp)
 	}
-	d.err = d.drawInternal(next)
-}
-
-// Err returns the last error that occurred
-func (d *Dev) Err() error {
-	return d.err
+	return d.drawInternal(next)
 }
 
 // Write writes a buffer of pixels to the display.
@@ -500,6 +492,4 @@ const (
 	i2cData = 0x40 // I²C transaction has stream of data bytes
 )
 
-var _ conn.Resource = &Dev{}
-var _ devices.Display = &Dev{}
-var _ fmt.Stringer = &Dev{}
+var _ display.Drawer = &Dev{}
